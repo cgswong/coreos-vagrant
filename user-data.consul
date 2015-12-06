@@ -1,0 +1,218 @@
+#cloud-config
+write_files:
+  - path: /etc/profile.d/aliases.sh
+    content: |
+      alias l='ls -lFh'
+      alias ll='ls -lFhA'
+  - path: /etc/profile.d/env.sh
+    content: |
+      shopt -s cdspell
+  - path: /etc/ntp.conf
+    content: |
+      server 0.pool.example.com
+      server 1.pool.example.com
+
+      # - Allow only time queries, at a limited rate.
+      # - Allow all local queries (IPv4, IPv6)
+      restrict default nomodify nopeer noquery limited kod
+      restrict 127.0.0.1
+      restrict [::1]
+  - path: /etc/systemd/timesyncd.conf
+    content: |
+      [Time]
+      NTP=0.pool.example.com 1.pool.example.com
+  - path: /etc/consul.d/server.json
+    permissions: 0644
+    content: |
+      {
+        "bind_addr": "$public_ipv4",
+        "client_addr": "$public_ipv4",
+        "data_dir": "/var/lib/consul",
+        "datacenter": "vagrant",
+        "disable_update_check": true,
+        "domain": "local",
+        "leave_on_terminate": true,
+        "log_level": "INFO",
+        "rejoin_after_leave": true,
+        "ui_dir": "/opt/consul/webui/dist"
+      }
+  - path: /opt/consul/bin/bootstrap.sh
+    permissions: 0755
+    content: |
+      #!/bin/bash
+      source /etc/environment
+      name=$(cat /etc/machine-id)
+
+      if [ ! -f /opt/consul/bin/consul ]; then
+        curl --insecure --output /tmp/consul.zip -sSL https://dl.bintray.com/mitchellh/consul/0.5.2_linux_amd64.zip
+        mkdir -p /opt/consul/bin
+        unzip -q /tmp/consul.zip -d /opt/consul/bin/
+        chmod +x /opt/consul/bin/consul
+        curl --insecure --output /tmp/webui.zip -sSL https://dl.bintray.com/mitchellh/consul/0.5.2_web_ui.zip
+        mkdir -p /opt/consul/webui
+        unzip -q /tmp/webui.zip -d /opt/consul/webui/
+        rm /tmp/consul.zip /tmp/webui.zip
+      fi
+
+      flags=""
+
+      if etcdctl mk /consul.io/bootstrap/started true; then
+        flags="-server -bootstrap-expect 3"
+      else
+        echo "This cluster has already been bootstrapped"
+        etcdctl set /consul.io/bootstrap/machines/${name} ${COREOS_PUBLIC_IPV4}
+        flags=$(etcdctl ls /consul.io/bootstrap/machines | while read line; do
+          ip=$(etcdctl get ${line})
+          echo ${flags} -join ${ip}
+        done)
+        if [ $(etcdctl ls /consul.io/bootstrap/machines | wc -l) -lt 5 ]; then
+          flags=$(echo ${flags} -server)
+        fi
+      fi
+
+      GOMAXPROCS=10 /opt/consul/bin/consul agent --config-dir=/etc/consul.d ${flags}
+coreos:
+  etcd2:
+    #generate a new token for each unique cluster from https://discovery.etcd.io/new
+    #discovery: https://discovery.etcd.io/<token>
+    # multi-region and multi-cloud deployments need to use $public_ipv4
+    advertise-client-urls: http://$public_ipv4:2379
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    # listen on both the official ports and the legacy ports
+    # legacy ports can be omitted if your application doesn't depend on them
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+  fleet:
+    public-ip: $public_ipv4
+  flannel:
+    interface: $public_ipv4
+  units:
+    - name: settimezone.service
+      command: start
+      content: |
+        [Unit]
+        Description=Set the timezone
+
+        [Service]
+        ExecStart=/usr/bin/timedatectl set-timezone UTC
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+      drop-ins:
+        - name: 50-fleet-wait-on-etcd2.conf
+          content: |
+            [Unit]
+            Requires=etcd2.service
+            After=etcd2.service
+    - name: fleet.socket
+      drop-ins:
+        - name: 30-ListenStream.conf
+          content: |
+            [Socket]
+            ListenStream=49153
+    - name: flanneld.service
+      drop-ins:
+      - name: 50-network-config.conf
+        content: |
+          [Service]
+          ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{ "Network": "10.1.0.0/16" }'
+      command: start
+    - name: docker.service
+      drop-ins:
+        - name: 60-docker-wait-on-flanneld.conf
+          content: |
+            [Unit]
+            After=flanneld.service
+            Requires=flanneld.service
+            Restart=always
+    - name: docker-tcp.socket
+      command: start
+      enable: true
+      content: |
+        [Unit]
+        Description=Docker Socket for the API
+
+        [Socket]
+        ListenStream=2375
+        Service=docker.service
+        BindIPv6Only=both
+
+        [Install]
+        WantedBy=sockets.target
+  - name: consul.service
+    command: start
+    content: |
+      [Unit]
+      Description=consul
+
+      [Service]
+      ExecStart=/opt/consul/bin/bootstrap.sh
+    - name: registrator.service
+      command: start
+      content: |
+        [Unit]
+        Description=Docker Service Registration
+        Requires=docker.service
+        Requires=etcd2.service
+        Requires=flanneld.service
+        After=docker.service
+        After=etcd2.service
+        After=flanneld.service
+
+        [Service]
+        TimeoutStartSec=5m
+        Restart=on-failure
+        RestartSec=10s
+        ExecStartPre=/bin/sh -c "docker inspect %p &>/dev/null && docker rm -f %p || true"
+        ExecStartPre=/usr/bin/docker pull gliderlabs/registrator:latest
+        ExecStart=/usr/bin/docker run --log-driver=syslog --name %p --net=host -v /var/run/docker.sock:/tmp/docker.sock gliderlabs/registrator:latest -internal -resync 30 etcd://localhost:2379/services
+
+        ExecStop=-/usr/bin/docker stop %p
+    - name: janitor.service
+      command: start
+      content: |
+        [Unit]
+        Description=Docker Janitor (DJ) Service
+        Requires=docker.service
+        Requires=flanneld.service
+        After=docker.service
+        After=flanneld.service
+
+        [Service]
+        TimeoutStartSec=10m
+        Type=oneshot
+        ExecStartPre=/bin/sh -c "docker inspect %p &>/dev/null && docker rm -f %p || true"
+        ExecStartPre=/usr/bin/docker pull remmelt/docker-gc:latest
+        ExecStart=/usr/bin/docker run --rm --log-driver=syslog --name %p -v /var/run/docker.sock:/var/run/docker.sock remmelt/docker-gc:latest
+    - name: janitor.timer
+      command: start
+      enable: true
+      content: |
+        [Unit]
+        Description=Run Docker Janitor (DJ) daily at 1am
+
+        [Timer]
+        OnBootSec=1d
+        OnCalendar=01:00
+        Persistent=true
+    - name: cadvisor.service
+      command: start
+      content: |
+        [Unit]
+        Description=cAdvisor metrics monitoring
+        Requires=docker.service
+        Requires=flanneld.service
+        After=docker.service
+        After=flanneld.service
+
+        [Service]
+        TimeoutStartSec=5m
+        Restart=on-failure
+        RestartSec=10s
+        ExecStartPre=/bin/sh -c "docker inspect %p &>/dev/null && docker rm -f %p || true"
+        ExecStartPre=/usr/bin/docker pull google/cadvisor:latest
+        ExecStart=/usr/bin/docker run --log-driver=syslog --name=%p -v /:/rootfs:ro -v /var/run:/var/run:rw -v /sys:/sys:ro -v /var/lib/docker:/var/lib/docker:ro -v /var/log:/var/log:ro -p 8080:8080 google/cadvisor:latest --logtostderr
+        ExecStop=/usr/bin/docker stop %p
