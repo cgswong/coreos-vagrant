@@ -84,6 +84,7 @@ coreos:
     listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
   fleet:
     public-ip: $public_ipv4
+    metadata: "role=master,dc=local,env=dev,type=control"
   flannel:
     interface: $public_ipv4
   units:
@@ -126,7 +127,7 @@ coreos:
           content: |
             [Unit]
             After=flanneld.service
-            Requires=flanneld.service
+            Wants=flanneld.service
             Restart=always
     - name: docker-tcp.socket
       command: start
@@ -142,14 +143,14 @@ coreos:
 
         [Install]
         WantedBy=sockets.target
-  - name: consul.service
-    command: start
-    content: |
-      [Unit]
-      Description=consul
+    - name: consul.service
+      command: start
+      content: |
+        [Unit]
+        Description=consul
 
-      [Service]
-      ExecStart=/opt/consul/bin/bootstrap.sh
+        [Service]
+        ExecStart=/opt/consul/bin/bootstrap.sh
     - name: registrator.service
       command: start
       content: |
@@ -157,18 +158,17 @@ coreos:
         Description=Docker Service Registration
         Requires=docker.service
         Requires=etcd2.service
-        Requires=flanneld.service
         After=docker.service
         After=etcd2.service
-        After=flanneld.service
 
         [Service]
         TimeoutStartSec=5m
         Restart=on-failure
         RestartSec=10s
+        Environment="DOCKER_IMAGE=gliderlabs/registrator:latest"
         ExecStartPre=/bin/sh -c "docker inspect %p &>/dev/null && docker rm -f %p || true"
-        ExecStartPre=/usr/bin/docker pull gliderlabs/registrator:latest
-        ExecStart=/usr/bin/docker run --log-driver=syslog --name %p --net=host -v /var/run/docker.sock:/tmp/docker.sock gliderlabs/registrator:latest -internal -resync 30 etcd://localhost:2379/services
+        ExecStartPre=/usr/bin/docker pull ${DOCKER_IMAGE}
+        ExecStart=/usr/bin/docker run --log-driver=syslog --name %p --net=host -v /var/run/docker.sock:/tmp/docker.sock ${DOCKER_IMAGE} -internal -resync 30 etcd://localhost:2379/services
 
         ExecStop=-/usr/bin/docker stop %p
     - name: janitor.service
@@ -177,16 +177,15 @@ coreos:
         [Unit]
         Description=Docker Janitor (DJ) Service
         Requires=docker.service
-        Requires=flanneld.service
         After=docker.service
-        After=flanneld.service
 
         [Service]
         TimeoutStartSec=10m
         Type=oneshot
+        Environment="DOCKER_IMAGE=remmelt/docker-gc:latest"
         ExecStartPre=/bin/sh -c "docker inspect %p &>/dev/null && docker rm -f %p || true"
-        ExecStartPre=/usr/bin/docker pull remmelt/docker-gc:latest
-        ExecStart=/usr/bin/docker run --rm --log-driver=syslog --name %p -v /var/run/docker.sock:/var/run/docker.sock remmelt/docker-gc:latest
+        ExecStartPre=/usr/bin/docker pull ${DOCKER_IMAGE}
+        ExecStart=/usr/bin/docker run --rm --log-driver=syslog --name %p -v /var/run/docker.sock:/var/run/docker.sock ${DOCKER_IMAGE}
     - name: janitor.timer
       command: start
       enable: true
@@ -204,15 +203,14 @@ coreos:
         [Unit]
         Description=cAdvisor metrics monitoring
         Requires=docker.service
-        Requires=flanneld.service
         After=docker.service
-        After=flanneld.service
 
         [Service]
         TimeoutStartSec=5m
         Restart=on-failure
         RestartSec=10s
+        Environment="DOCKER_IMAGE=google/cadvisor:latest"
         ExecStartPre=/bin/sh -c "docker inspect %p &>/dev/null && docker rm -f %p || true"
-        ExecStartPre=/usr/bin/docker pull google/cadvisor:latest
-        ExecStart=/usr/bin/docker run --log-driver=syslog --name=%p -v /:/rootfs:ro -v /var/run:/var/run:rw -v /sys:/sys:ro -v /var/lib/docker:/var/lib/docker:ro -v /var/log:/var/log:ro -p 8080:8080 google/cadvisor:latest --logtostderr
+        ExecStartPre=/usr/bin/docker pull ${DOCKER_IMAGE}
+        ExecStart=/usr/bin/docker run --log-driver=syslog --name=%p -v /:/rootfs:ro -v /var/run:/var/run:rw -v /sys:/sys:ro -v /var/lib/docker:/var/lib/docker:ro -v /var/log:/var/log:ro -p 8080:8080 ${DOCKER_IMAGE} --logtostderr
         ExecStop=/usr/bin/docker stop %p
